@@ -10,4 +10,6 @@ export const config: AppConfig = {
   fallbackEnabled: process.env.AI_FALLBACK_ENABLED === "true",
   logLevel: process.env.LOG_LEVEL || "info",
   geminiModel: process.env.GEMINI_MODEL || "gemini-2.0-flash",
+  geminiEmbeddingsModel:
+    process.env.GEMINI_EMBEDDINGS_MODEL || "gemini-embedding-001",
 };

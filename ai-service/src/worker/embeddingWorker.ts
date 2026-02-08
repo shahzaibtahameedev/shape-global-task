@@ -4,9 +4,6 @@ import {
 } from "../services/embeddingService";
 import { logger } from "../utils/logger";
 
-/**
- * This represents a queue job
- */
 export type EmbeddingJob = {
   feedbackId: string;
   userId?: string;
