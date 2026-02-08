@@ -1,30 +1,13 @@
-import { GoogleGenerativeAI, GenerativeModel } from '@google/generative-ai';
-import { config } from '../config';
-import { logger } from '../utils/logger';
-import { SentimentResult, TagExtractionResult, InsightsResult } from '../types';
+import { config } from "../config";
+import { logger } from "../utils/logger";
+import { SentimentResult, TagExtractionResult, InsightsResult } from "../types";
+import { processEmbeddingJob } from "../worker/embeddingWorker";
+import { randomUUID } from "crypto";
+import { isConfigured, model } from "../infra/geminiClient";
 
-
-let genAI: GoogleGenerativeAI | null = null;
-let model: GenerativeModel | null = null;
-let isConfigured = false;
-
-const initialize = (): void => {
-  if (config.geminiApiKey) {
-    genAI = new GoogleGenerativeAI(config.geminiApiKey);
-    model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-    isConfigured = true;
-    logger.info('Gemini AI initialized successfully');
-  } else {
-    logger.warn('Gemini API key not configured - using fallback responses');
-    isConfigured = false;
-  }
-};
-
-initialize();
-
-export const isGeminiConfigured = (): boolean => isConfigured;
-
-export const analyzeSentiment = async (text: string): Promise<SentimentResult> => {
+export const analyzeSentiment = async (
+  text: string,
+): Promise<SentimentResult> => {
   if (!isConfigured || !model) {
     return getFallbackSentiment(text);
   }
@@ -46,15 +29,15 @@ export const analyzeSentiment = async (text: string): Promise<SentimentResult> =
       const parsed = JSON.parse(jsonMatch[0]);
       return {
         score: Math.max(-1, Math.min(1, parsed.score)),
-        label: parsed.label || 'neutral',
-        confidence: parsed.confidence || 0.8
+        label: parsed.label || "neutral",
+        confidence: parsed.confidence || 0.8,
       };
     }
 
-    throw new Error('Could not parse sentiment response');
+    throw new Error("Could not parse sentiment response");
   } catch (error) {
     const err = error as Error;
-    logger.error('Sentiment analysis failed', { error: err.message });
+    logger.error("Sentiment analysis failed", { error: err.message });
     if (config.fallbackEnabled) {
       return getFallbackSentiment(text);
     }
@@ -62,20 +45,19 @@ export const analyzeSentiment = async (text: string): Promise<SentimentResult> =
   }
 };
 
-export const extractTags = async (text: string): Promise<TagExtractionResult> => {
+export const extractTags = async (
+  text: string,
+): Promise<TagExtractionResult> => {
   if (!isConfigured || !model) {
     return getFallbackTags(text);
   }
 
   try {
     const prompt = `Extract key themes and tags from the following text. Respond with ONLY a JSON object in this exact format:
-{"tags": ["tag1", "tag2", "tag3"], "primaryTheme": "<main theme>"}
-
-Limit to 5 most relevant tags. Tags should be lowercase single words or short phrases.
-
-Text to analyze: "${text}"
-
-Respond with only the JSON object, no other text.`;
+                    {"tags": ["tag1", "tag2", "tag3"], "primaryTheme": "<main theme>"}
+                    Limit to 5 most relevant tags. Tags should be lowercase single words or short phrases.
+                    Text to analyze: "${text}"
+                    Respond with only the JSON object, no other text.`;
 
     const result = await model.generateContent(prompt);
     const response = await result.response;
@@ -86,14 +68,14 @@ Respond with only the JSON object, no other text.`;
       const parsed = JSON.parse(jsonMatch[0]);
       return {
         tags: Array.isArray(parsed.tags) ? parsed.tags.slice(0, 5) : [],
-        primaryTheme: parsed.primaryTheme || 'general'
+        primaryTheme: parsed.primaryTheme || "general",
       };
     }
 
-    throw new Error('Could not parse tags response');
+    throw new Error("Could not parse tags response");
   } catch (error) {
     const err = error as Error;
-    logger.error('Tag extraction failed', { error: err.message });
+    logger.error("Tag extraction failed", { error: err.message });
     if (config.fallbackEnabled) {
       return getFallbackTags(text);
     }
@@ -101,7 +83,10 @@ Respond with only the JSON object, no other text.`;
   }
 };
 
-export const generateInsights = async (text: string, userId?: string): Promise<InsightsResult> => {
+export const generateInsights = async (
+  text: string,
+  userId?: string,
+): Promise<InsightsResult> => {
   if (!isConfigured || !model) {
     return getFallbackInsights(text);
   }
@@ -117,15 +102,15 @@ export const generateInsights = async (text: string, userId?: string): Promise<I
                       "actionItems": ["suggestion1", "suggestion2"]
                     }
 
-Guidelines:
-- sentimentScore: -1 is very negative, 0 is neutral, 1 is very positive
-- engagementLevel: Based on how engaged/invested the user seems
-- tags: Extract 3-5 key themes, lowercase
-- actionItems: 1-2 actionable suggestions based on feedback
+                    Guidelines:
+                    - sentimentScore: -1 is very negative, 0 is neutral, 1 is very positive
+                    - engagementLevel: Based on how engaged/invested the user seems
+                    - tags: Extract 3-5 key themes, lowercase
+                    - actionItems: 1-2 actionable suggestions based on feedback
 
-User feedback: "${text}"
+                    User feedback: "${text}"
 
-Respond with only the JSON object, no other text.`;
+                    Respond with only the JSON object, no other text.`;
 
     const result = await model.generateContent(prompt);
     const response = await result.response;
@@ -134,21 +119,46 @@ Respond with only the JSON object, no other text.`;
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
-      return {
+
+      const insights = {
         sentimentScore: Math.max(-1, Math.min(1, parsed.sentimentScore || 0)),
-        sentimentLabel: parsed.sentimentLabel || 'neutral',
+        sentimentLabel: parsed.sentimentLabel || "neutral",
         tags: Array.isArray(parsed.tags) ? parsed.tags.slice(0, 5) : [],
         engagementLevel: validateEngagementLevel(parsed.engagementLevel),
-        summary: parsed.summary || '',
-        actionItems: Array.isArray(parsed.actionItems) ? parsed.actionItems.slice(0, 3) : [],
-        analyzedAt: new Date().toISOString()
+        summary: parsed.summary || "",
+        actionItems: Array.isArray(parsed.actionItems)
+          ? parsed.actionItems.slice(0, 3)
+          : [],
+        analyzedAt: new Date().toISOString(),
+      };
+
+      const feedbackId = randomUUID();
+
+      //Async worker
+      processEmbeddingJob({
+        feedbackId,
+        userId,
+        text,
+        insights,
+      }).catch(() => {});
+
+      return {
+        sentimentScore: Math.max(-1, Math.min(1, parsed.sentimentScore || 0)),
+        sentimentLabel: parsed.sentimentLabel || "neutral",
+        tags: Array.isArray(parsed.tags) ? parsed.tags.slice(0, 5) : [],
+        engagementLevel: validateEngagementLevel(parsed.engagementLevel),
+        summary: parsed.summary || "",
+        actionItems: Array.isArray(parsed.actionItems)
+          ? parsed.actionItems.slice(0, 3)
+          : [],
+        analyzedAt: new Date().toISOString(),
       };
     }
 
-    throw new Error('Could not parse insights response');
+    throw new Error("Could not parse insights response");
   } catch (error) {
     const err = error as Error;
-    logger.error('Insights generation failed', { error: err.message, userId });
+    logger.error("Insights generation failed", { error: err.message, userId });
     if (config.fallbackEnabled) {
       return getFallbackInsights(text);
     }
@@ -156,25 +166,50 @@ Respond with only the JSON object, no other text.`;
   }
 };
 
-const validateEngagementLevel = (level: string): 'Low' | 'Medium' | 'High' | 'VeryHigh' => {
-  const validLevels: Array<'Low' | 'Medium' | 'High' | 'VeryHigh'> = ['Low', 'Medium', 'High', 'VeryHigh'];
-  if (validLevels.includes(level as 'Low' | 'Medium' | 'High' | 'VeryHigh')) {
-    return level as 'Low' | 'Medium' | 'High' | 'VeryHigh';
+const validateEngagementLevel = (
+  level: string,
+): "Low" | "Medium" | "High" | "VeryHigh" => {
+  const validLevels: Array<"Low" | "Medium" | "High" | "VeryHigh"> = [
+    "Low",
+    "Medium",
+    "High",
+    "VeryHigh",
+  ];
+  if (validLevels.includes(level as "Low" | "Medium" | "High" | "VeryHigh")) {
+    return level as "Low" | "Medium" | "High" | "VeryHigh";
   }
-  return 'Medium';
+  return "Medium";
 };
 
 const getFallbackSentiment = (text: string): SentimentResult => {
-  const positiveWords = ['good', 'great', 'excellent', 'love', 'enjoy', 'happy', 'amazing', 'wonderful'];
-  const negativeWords = ['bad', 'poor', 'terrible', 'hate', 'confusing', 'frustrated', 'awful', 'horrible'];
+  const positiveWords = [
+    "good",
+    "great",
+    "excellent",
+    "love",
+    "enjoy",
+    "happy",
+    "amazing",
+    "wonderful",
+  ];
+  const negativeWords = [
+    "bad",
+    "poor",
+    "terrible",
+    "hate",
+    "confusing",
+    "frustrated",
+    "awful",
+    "horrible",
+  ];
 
   const lowerText = text.toLowerCase();
   let score = 0;
 
-  positiveWords.forEach(word => {
+  positiveWords.forEach((word) => {
     if (lowerText.includes(word)) score += 0.2;
   });
-  negativeWords.forEach(word => {
+  negativeWords.forEach((word) => {
     if (lowerText.includes(word)) score -= 0.2;
   });
 
@@ -182,36 +217,35 @@ const getFallbackSentiment = (text: string): SentimentResult => {
 
   return {
     score,
-    label: score > 0.1 ? 'positive' : score < -0.1 ? 'negative' : 'neutral',
+    label: score > 0.1 ? "positive" : score < -0.1 ? "negative" : "neutral",
     confidence: 0.5,
-    isFallback: true
+    isFallback: true,
   };
 };
 
-
 const getFallbackTags = (text: string): TagExtractionResult => {
   const commonThemes: Record<string, string[]> = {
-    'product': ['product', 'feature', 'functionality'],
-    'usability': ['usability', 'easy', 'difficult', 'confusing', 'intuitive'],
-    'support': ['support', 'help', 'service', 'response'],
-    'onboarding': ['onboarding', 'getting started', 'tutorial', 'learning'],
-    'performance': ['fast', 'slow', 'performance', 'speed'],
-    'pricing': ['price', 'cost', 'expensive', 'cheap', 'value']
+    product: ["product", "feature", "functionality"],
+    usability: ["usability", "easy", "difficult", "confusing", "intuitive"],
+    support: ["support", "help", "service", "response"],
+    onboarding: ["onboarding", "getting started", "tutorial", "learning"],
+    performance: ["fast", "slow", "performance", "speed"],
+    pricing: ["price", "cost", "expensive", "cheap", "value"],
   };
 
   const lowerText = text.toLowerCase();
   const tags: string[] = [];
 
   Object.entries(commonThemes).forEach(([theme, keywords]) => {
-    if (keywords.some(kw => lowerText.includes(kw))) {
+    if (keywords.some((kw) => lowerText.includes(kw))) {
       tags.push(theme);
     }
   });
 
   return {
-    tags: tags.length > 0 ? tags : ['general'],
-    primaryTheme: tags[0] || 'general',
-    isFallback: true
+    tags: tags.length > 0 ? tags : ["general"],
+    primaryTheme: tags[0] || "general",
+    isFallback: true,
   };
 };
 
@@ -219,18 +253,18 @@ const getFallbackInsights = (text: string): InsightsResult => {
   const sentiment = getFallbackSentiment(text);
   const tagsResult = getFallbackTags(text);
 
-  let engagementLevel: 'Low' | 'Medium' | 'High' | 'VeryHigh' = 'Medium';
-  if (text.length > 200) engagementLevel = 'High';
-  if (text.length < 50) engagementLevel = 'Low';
+  let engagementLevel: "Low" | "Medium" | "High" | "VeryHigh" = "Medium";
+  if (text.length > 200) engagementLevel = "High";
+  if (text.length < 50) engagementLevel = "Low";
 
   return {
     sentimentScore: sentiment.score,
     sentimentLabel: sentiment.label,
     tags: tagsResult.tags,
     engagementLevel,
-    summary: 'Fallback analysis - AI service unavailable',
-    actionItems: ['Review feedback manually'],
+    summary: "Fallback analysis - AI service unavailable",
+    actionItems: ["Review feedback manually"],
     analyzedAt: new Date().toISOString(),
-    isFallback: true
+    isFallback: true,
   };
 };
